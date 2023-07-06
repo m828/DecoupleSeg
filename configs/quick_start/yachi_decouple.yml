@@ -1,0 +1,72 @@
+
+batch_size: 8
+iters: 40000
+
+train_dataset:
+  edge: True
+  type: Dataset
+  dataset_root: data/yachi
+  num_classes: 2
+  mode: train
+  train_path: data/yachi/train.txt
+  transforms:
+    - type: ResizeStepScaling
+      min_scale_factor: 0.5
+      max_scale_factor: 2.5
+      scale_step_size: 0.25
+    - type: RandomPaddingCrop
+      crop_size: [640, 320]
+    - type: RandomHorizontalFlip
+    - type: RandomDistort
+      brightness_range: 0.5
+      contrast_range: 0.5
+      saturation_range: 0.5
+    - type: Normalize
+
+
+val_dataset:
+  type: Dataset
+  dataset_root: data/yachi
+  num_classes: 2
+  mode: val
+  val_path: data/yachi/val.txt
+  transforms:
+    - type: Normalize
+
+optimizer:
+  type: sgd
+  momentum: 0.9
+  weight_decay: 5.0e-4
+
+lr_scheduler:
+  type: PolynomialDecay
+  learning_rate: 0.01
+  end_lr: 0
+  power: 0.9
+  warmup_iters: 200
+  warmup_start_lr: 1.0e-5
+
+loss:
+  types:
+    - type: OhemCrossEntropyLoss
+    - type: RelaxBoundaryLoss
+    - type: BCELoss
+      weight: 'dynamic'
+      edge_label: True
+    - type: OhemEdgeAttentionLoss
+  coef: [1,1,25,1]
+
+
+
+model:
+  type: DecoupledSegNet
+  backbone:
+    type: ResNet50_vd
+    output_stride: 8
+    multi_grid: [1, 2, 4]
+    pretrained: https://bj.bcebos.com/paddleseg/dygraph/resnet50_vd_ssld_v2.tar.gz
+  backbone_indices: [0, 3]
+  aspp_ratios: [1, 12, 24, 36]
+  aspp_out_channels: 256
+  align_corners: False
+  # pretrained: null
