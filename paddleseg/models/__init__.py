@@ -20,3 +20,4 @@ from .deeplab import *
 from .decoupled_segnet import DecoupledSegNet
 from .stdcseg import STDCSeg
 from .pp_liteseg import PPLiteSeg
+from .gscnn import GSCNNHead, ASPPModule

@@ -23,6 +23,7 @@ from paddleseg.models import layers
 from paddleseg.models.backbones import resnet_vd
 from paddleseg.models import deeplab
 from paddleseg.utils import utils
+from .gscnn import GSCNNHead, ASPPModule, GatedSpatailConv2d
 
 
 @manager.MODELS.add_component
@@ -63,15 +64,29 @@ class DecoupledSegNet(nn.Layer):
         self.head = DecoupledSegNetHead(num_classes, backbone_indices,
                                         backbone_channels, aspp_ratios,
                                         aspp_out_channels, align_corners)
+
+        # self.aspp = ASPPModule(
+        #     aspp_ratios=aspp_ratios,
+        #     in_channels=backbone_channels[-1],
+        #     out_channels=aspp_out_channels,
+        #     align_corners=self.align_corners,
+        #     image_pooling=True)
+        #
+        # self.decoder = deeplab.Decoder(
+        #     num_classes=num_classes,
+        #     in_channels=backbone_channels[0],
+        #     align_corners=self.align_corners)
+
         self.align_corners = align_corners
         self.pretrained = pretrained
         self.init_weight()
 
     def forward(self, x):
         feat_list = self.backbone(x)
-        logit_list = self.head(feat_list)
 
-        seg_logit, body_logit, edge_logit = [
+        logit_list = self.head(x, feat_list, self.backbone.conv1_logit)
+
+        seg_logit, body_logit, edge_logit, gscnn_edge_out = [
             F.interpolate(
                 logit,
                 paddle.shape(x)[2:],
@@ -80,7 +95,8 @@ class DecoupledSegNet(nn.Layer):
         ]
 
         if self.training:
-            return [seg_logit, body_logit, edge_logit, (seg_logit, edge_logit)]
+            return [seg_logit, body_logit, edge_logit, (seg_logit, edge_logit), seg_logit, gscnn_edge_out]
+
         return [seg_logit]
 
     def init_weight(self):
@@ -109,7 +125,7 @@ class DecoupledSegNetHead(nn.Layer):
         super().__init__()
         self.backbone_indices = backbone_indices
         self.align_corners = align_corners
-        self.aspp = layers.ASPPModule(
+        self.aspp = ASPPModule(
             aspp_ratios=aspp_ratios,
             in_channels=backbone_channels[backbone_indices[1]],
             out_channels=aspp_out_channels,
@@ -154,11 +170,111 @@ class DecoupledSegNetHead(nn.Layer):
             nn.Conv2D(
                 256, num_classes, kernel_size=1, bias_attr=False))
 
-    def forward(self, feat_list):
+        # GSCNN
+        self.dsn1 = nn.Conv2D(
+            backbone_channels[1], 1, kernel_size=1)
+        self.dsn2 = nn.Conv2D(
+            backbone_channels[2], 1, kernel_size=1)
+        self.dsn3 = nn.Conv2D(
+            backbone_channels[3], 1, kernel_size=1)
+
+        self.res1 = resnet_vd.BasicBlock(64, 64, stride=1)
+        self.d1 = nn.Conv2D(64, 32, kernel_size=1)
+        self.gate1 = GatedSpatailConv2d(32, 32)
+        self.res2 = resnet_vd.BasicBlock(32, 32, stride=1)
+        self.d2 = nn.Conv2D(32, 16, kernel_size=1)
+        self.gate2 = GatedSpatailConv2d(16, 16)
+        self.res3 = resnet_vd.BasicBlock(16, 16, stride=1)
+        self.d3 = nn.Conv2D(16, 8, kernel_size=1)
+        self.gate3 = GatedSpatailConv2d(8, 8)
+        self.fuse = nn.Conv2D(8, 1, kernel_size=1, bias_attr=False)
+
+        self.cw = nn.Conv2D(2, 1, kernel_size=1, bias_attr=False)
+
+        self.edge_conv = layers.ConvBNReLU(
+            1, 48, kernel_size=1, bias_attr=False)
+
+    def forward(self, x, feat_list, mlf):
         fine_fea = feat_list[self.backbone_indices[0]]
         fine_size = paddle.shape(fine_fea)
+
+        l1, l2, l3= [
+            feat_list[i]
+            for i in range(1, 4)
+        ]
+        s1 = F.interpolate(
+            self.dsn1(l1),
+            fine_size[2:],
+            mode='bilinear',
+            align_corners=self.align_corners)
+        s2 = F.interpolate(
+            self.dsn2(l2),
+            fine_size[2:],
+            mode='bilinear',
+            align_corners=self.align_corners)
+        s3 = F.interpolate(
+            self.dsn3(l3),
+            fine_size[2:],
+            mode='bilinear',
+            align_corners=self.align_corners)
+
+        # Get image gradient
+        input_shape = paddle.shape(x)
+        im_arr = x.numpy().transpose((0, 2, 3, 1))
+        im_arr = ((im_arr * 0.5 + 0.5) * 255).astype(np.uint8)
+        canny = np.zeros((input_shape[0], 1, input_shape[2], input_shape[3]))
+        for i in range(input_shape[0]):
+            canny[i] = cv2.Canny(im_arr[i], 10, 100)
+        canny = F.interpolate(
+                paddle.to_tensor(canny),
+                fine_size[2:],
+                mode='bilinear',
+                align_corners=self.align_corners)
+        canny = canny / 255
+        canny = paddle.to_tensor(canny).astype('float32')
+        canny.stop_gradient = True
+
+        cs = self.res1(mlf)
+        cs = F.interpolate(
+            cs,
+            fine_size[2:],
+            mode='bilinear',
+            align_corners=self.align_corners)
+        cs = self.d1(cs)
+        cs = self.gate1(cs, s1)
+
+        cs = self.res2(cs)
+        cs = F.interpolate(
+            cs,
+            fine_size[2:],
+            mode='bilinear',
+            align_corners=self.align_corners)
+        cs = self.d2(cs)
+        cs = self.gate2(cs, s2)
+
+        cs = self.res3(cs)
+        cs = F.interpolate(
+            cs,
+            fine_size[2:],
+            mode='bilinear',
+            align_corners=self.align_corners)
+        cs = self.d3(cs)
+        cs = self.gate3(cs, s3)
+        cs = self.fuse(cs)
+        cs = F.interpolate(
+            cs,
+            fine_size[2:],
+            mode='bilinear',
+            align_corners=self.align_corners)
+        gscnn_edge_out = F.sigmoid(cs)
+
+        cat = paddle.concat([gscnn_edge_out, canny], axis=1)
+        acts = self.cw(cat)
+        acts = F.sigmoid(acts)
+
+        # Decouple Seg Net
         x = feat_list[self.backbone_indices[1]]
-        aspp = self.aspp(x)
+        aspp = self.aspp(x, acts)
 
         # decoupled
         seg_body, seg_edge = self.squeeze_body_edge(aspp)
@@ -188,7 +304,7 @@ class DecoupledSegNetHead(nn.Layer):
         seg_out = paddle.concat([aspp, seg_out], axis=1)
         seg_final_out = self.final_seg(seg_out)
 
-        return [seg_final_out, seg_body_out, seg_edge_out]
+        return [seg_final_out, seg_body_out, seg_edge_out, gscnn_edge_out]
 
 
 class SqueezeBodyEdge(nn.Layer):

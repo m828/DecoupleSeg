@@ -16,11 +16,14 @@ train_dataset:
       scale_step_size: 0.25
     - type: RandomPaddingCrop
       crop_size: [640, 320]
+#    - type: RandomScaleAspect
     - type: RandomHorizontalFlip
+#    - type: RandomVerticalFlip
     - type: RandomDistort
       brightness_range: 0.5
       contrast_range: 0.5
       saturation_range: 0.5
+#    - type: RandomBlur
     - type: Normalize
 
 
@@ -54,7 +57,10 @@ loss:
       weight: 'dynamic'
       edge_label: True
     - type: OhemEdgeAttentionLoss
-  coef: [1,1,25,1]
+    - type: DualTaskLoss
+    - type: BCELoss
+      edge_label: True
+  coef: [1,1,25,1,1,20]
 
 
 
